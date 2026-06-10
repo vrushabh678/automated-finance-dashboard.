@@ -8,18 +8,14 @@ import json
 st.set_page_config(page_title="Automated Financial Dashboard", page_icon="📈", layout="wide")
 
 # 2. Initialize Groq API Client securely
-# (Try cloud secrets first, fallback to hardcoded for local testing)
-try:
-    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
-except:
-    # REPLACE THIS WITH YOUR REAL KEY FOR LOCAL TESTING, BUT REMOVE BEFORE GITHUB UPLOAD
-    GROQ_API_KEY = "YOUR_API_KEY_HERE"
-
+# Streamlit Cloud automatically pulls this from your Advanced Settings -> Secrets
+GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
 
 
 # 3. PDF Extraction Helper
 def extract_text_from_pdf(uploaded_file):
+    uploaded_file.seek(0) # Reset file pointer for Streamlit re-runs
     doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
     text = ""
     for page in doc:
@@ -30,6 +26,9 @@ def extract_text_from_pdf(uploaded_file):
 # 4. LLM Data Extraction Helper
 def analyze_financials(text):
     try:
+        # Safe text slicing to avoid mid-number cuts
+        safe_text = text[:20000].rsplit('\n', 1)[0]
+        
         response = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[
@@ -48,7 +47,7 @@ def analyze_financials(text):
                 },
                 {
                     "role": "user",
-                    "content": f"Extract the metrics from this report:\n\n{text[:20000]}"
+                    "content": f"Extract the metrics from this report:\n\n{safe_text}"
                 }
             ],
             response_format={"type": "json_object"},
@@ -110,21 +109,38 @@ if uploaded_pdf:
             # Step C: Pandas Calculation Layer
             df = pd.DataFrame(extracted_data)
 
-            # FIX: Force chronological order (oldest to newest) BEFORE doing math
+            # Strict column enforcer
+            expected_cols = ['year', 'revenue', 'net_profit', 'total_debt', 'eps']
+            for col in expected_cols:
+                if col not in df.columns:
+                    df[col] = None 
+            df = df[expected_cols] 
+
+            # Force chronological order (oldest to newest) BEFORE doing math
             df = df.sort_values(by="year", ascending=True).reset_index(drop=True)
 
-            # Calculate YoY Growth if we have multiple years
+            # Ensure numeric typing for math
+            df['revenue'] = pd.to_numeric(df['revenue'], errors='coerce')
+            df['net_profit'] = pd.to_numeric(df['net_profit'], errors='coerce')
+
+            # Calculate YoY Growth
             if len(df) > 1:
                 df['Revenue Growth (%)'] = df['revenue'].pct_change() * 100
+                df['Revenue Growth (%)'] = df['Revenue Growth (%)'].round(2)
             else:
                 df['Revenue Growth (%)'] = 0.0
 
-            # Calculate Profit Margin
-            df['Profit Margin (%)'] = (df['net_profit'] / df['revenue']) * 100
-
+            # Safe Profit Margin Calculation (Avoid Division by Zero)
+            df['Profit Margin (%)'] = df.apply(
+                lambda row: (row['net_profit'] / row['revenue'] * 100) 
+                if pd.notna(row['revenue']) and row['revenue'] != 0 
+                else None, axis=1
+            )
+            
             # Clean up numbers for the math (used for charts)
-            df_math = df.copy()
-
+            df_math = df.copy() 
+            df_math['Revenue Growth (%)'] = df_math['Revenue Growth (%)'].fillna(0)
+            
             # Format the display dataframe (used for table and summary)
             df_display = df.fillna("N/A")
             for col in ['revenue', 'net_profit', 'total_debt', 'eps', 'Revenue Growth (%)', 'Profit Margin (%)']:
@@ -133,34 +149,77 @@ if uploaded_pdf:
             # Generate GPT Summary
             with st.spinner("Generating AI Executive Summary..."):
                 summary_text = generate_executive_summary(df_display.to_json(orient="records"))
+                summary_text = summary_text.replace("`", "") # Sanitize markdown
 
             st.success("Analysis Complete!")
+
+            # Key metrics summary cards (WITH NAN SAFETY AND DELTAS)
+            st.subheader("💡 Key Performance Indicators")
+            m1, m2, m3, m4 = st.columns(4)
+            
+            latest_rev = df_math['revenue'].iloc[-1] if not df_math.empty else None
+            latest_eps = df_math['eps'].iloc[-1] if not df_math.empty else None
+            avg_margin = df_math['Profit Margin (%)'].mean()
+            
+            rev_delta = None
+            eps_delta = None
+            
+            if len(df_math) > 1:
+                prev_rev = df_math['revenue'].iloc[-2]
+                if pd.notna(latest_rev) and pd.notna(prev_rev):
+                    rev_delta = latest_rev - prev_rev
+                    
+                prev_eps = df_math['eps'].iloc[-2]
+                if pd.notna(latest_eps) and pd.notna(prev_eps):
+                    eps_delta = latest_eps - prev_eps
+
+            m1.metric(
+                "Latest Revenue", 
+                f"{latest_rev:,.0f}" if pd.notna(latest_rev) else "N/A",
+                delta=f"{rev_delta:,.0f}" if pd.notna(rev_delta) else None
+            )
+            
+            m2.metric(
+                "Latest EPS", 
+                f"{latest_eps:.2f}" if pd.notna(latest_eps) else "N/A",
+                delta=f"{eps_delta:.2f}" if pd.notna(eps_delta) else None
+            )
+            
+            m3.metric(
+                "Avg Profit Margin", 
+                f"{avg_margin:.1f}%" if pd.notna(avg_margin) else "N/A"
+            )
+            
+            # Safe CAGR calculation
+            if len(df_math) > 1 and pd.notna(df_math['revenue'].iloc[0]) and df_math['revenue'].iloc[0] > 0 and pd.notna(latest_rev):
+                years = len(df_math) - 1
+                cagr = ((latest_rev / df_math['revenue'].iloc[0]) ** (1/years) - 1) * 100
+                m4.metric("Revenue CAGR", f"{cagr:.1f}%")
+            else:
+                m4.metric("Revenue CAGR", "N/A")
 
             # Display AI Summary
             st.info(f"**🤖 AI Analyst Summary:**\n\n{summary_text}")
 
-            # Step D: Dashboard Visualization
+            # Dashboard Visualization
             col1, col2 = st.columns(2)
 
             with col1:
-                st.subheader("📊 Extracted & Calculated Data")
-                # Sort descending just for the table view so newest is at the top
-                st.dataframe(df_display.sort_values(by="year", ascending=False), use_container_width=True,
-                             hide_index=True)
+                st.subheader("📊 Extracted Data")
+                st.dataframe(df_display, use_container_width=True, hide_index=True)
 
-                # Export to CSV
                 csv = df_display.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download Dashboard Data (CSV)", data=csv, file_name="financial_analysis.csv",
-                                   mime="text/csv")
+                st.download_button("📥 Download Data (CSV)", data=csv, file_name="financial_analysis.csv", mime="text/csv")
 
             with col2:
-                # Multiple Charts using Tabs
                 st.subheader("📈 Financial Trends")
-                tab1, tab2, tab3 = st.tabs(["Revenue", "Profit Margin", "EPS"])
-
+                tab1, tab2, tab3, tab4 = st.tabs(["Revenue", "Profit Margin", "EPS", "Revenue Growth"])
+                
                 with tab1:
                     st.bar_chart(data=df_math, x="year", y="revenue")
                 with tab2:
                     st.line_chart(data=df_math, x="year", y="Profit Margin (%)")
                 with tab3:
                     st.line_chart(data=df_math, x="year", y="eps")
+                with tab4:
+                    st.bar_chart(data=df_math.dropna(subset=['Revenue Growth (%)']), x="year", y="Revenue Growth (%)")
