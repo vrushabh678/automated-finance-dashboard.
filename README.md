@@ -1,7 +1,7 @@
 # 📈 Automated Financial Intelligence Dashboard
 
 **Live Demo:** https://data-fin.streamlit.app/  
-**Sample Data to Test:** 
+**Sample Data to Test:** Nestle India_AR FY 2025-26.pdf
 
 ### Overview
 An end-to-end data pipeline that extracts unstructured financial metrics from complex annual report PDFs, processes the data, and generates AI-driven equity research summaries. Built to automate the manual data entry process for financial analysts.
